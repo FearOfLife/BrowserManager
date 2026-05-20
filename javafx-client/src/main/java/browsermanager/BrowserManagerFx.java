@@ -45,8 +45,12 @@ import javafx.scene.control.cell.CheckBoxTableCell;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
+import javafx.scene.layout.Pane;
 import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
+import javafx.scene.shape.Rectangle;
 import javafx.stage.Stage;
 import javafx.util.Duration;
 
@@ -60,11 +64,15 @@ public final class BrowserManagerFx extends Application {
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final ApiClient api = new ApiClient("http://127.0.0.1:" + API_PORT);
 
+    private StackPane shell;
     private TableView<ProfileRow> table;
     private ListView<String> folderList;
+    private CheckBox selectAllHeader;
     private Label titleLabel;
+    private Label selectedCountLabel;
     private Label statusLabel;
     private String selectedFolder = DEFAULT_FOLDER;
+    private boolean updatingSelectionHeader;
     private Timeline poller;
     private Process backendProcess;
 
@@ -82,8 +90,10 @@ public final class BrowserManagerFx extends Application {
         content.setCenter(buildTable());
         content.setBottom(buildBottom());
         root.setCenter(content);
+        shell = new StackPane(root);
+        shell.getStyleClass().add("shell");
 
-        Scene scene = new Scene(root, 1280, 690);
+        Scene scene = new Scene(shell, 1280, 690);
         addStylesheet(scene);
         stage.setTitle("BrowserManager JavaFX");
         stage.setScene(scene);
@@ -117,7 +127,7 @@ public final class BrowserManagerFx extends Application {
         Button duplicate = button("Дублировать", () -> runAction("Дублирование", () -> api.duplicate(selectedIds())));
         Button delete = button("Удалить", () -> runAction("Удаление", () -> api.delete(selectedIds())));
         Button proxyPool = button("Прокси пул", this::showProxyPoolDialog);
-        Button create = button("Создать профиль", () -> runAction("Создание профиля", () -> api.createProfile(createProfileFolder())));
+        Button create = button("Создать профиль", this::showNewProfileDialog);
         create.getStyleClass().add("accent-button");
 
         HBox top = new HBox(10, titleLabel, subtitle, spacer, duplicate, delete, proxyPool, create);
@@ -131,8 +141,11 @@ public final class BrowserManagerFx extends Application {
         Label title = new Label("Папки");
         title.getStyleClass().add("sidebar-title");
 
-        Button addFolder = button("+ Папка", this::showCreateFolderDialog);
+        Button addFolder = button("Создать новую папку", this::showCreateFolderDialog);
         addFolder.getStyleClass().add("folder-add-button");
+
+        Region divider = new Region();
+        divider.getStyleClass().add("folder-divider");
 
         folderList = new ListView<>(folders);
         folderList.getStyleClass().add("folder-list");
@@ -145,7 +158,7 @@ public final class BrowserManagerFx extends Application {
             refreshProfiles();
         });
 
-        VBox sidebar = new VBox(10, title, addFolder, folderList);
+        VBox sidebar = new VBox(10, title, addFolder, divider, folderList);
         sidebar.getStyleClass().add("sidebar");
         VBox.setVgrow(folderList, Priority.ALWAYS);
         return sidebar;
@@ -160,12 +173,22 @@ public final class BrowserManagerFx extends Application {
         TableColumn<ProfileRow, Boolean> selected = new TableColumn<>("");
         selected.setCellValueFactory(data -> data.getValue().selectedProperty());
         selected.setCellFactory(CheckBoxTableCell.forTableColumn(selected));
+        selectAllHeader = new CheckBox();
+        selectAllHeader.getStyleClass().add("table-select-all");
+        selectAllHeader.selectedProperty().addListener((_obs, _old, value) -> {
+            if (updatingSelectionHeader) {
+                return;
+            }
+            profiles.forEach(row -> row.setSelected(value));
+            updateSelectionCount();
+        });
+        selected.setGraphic(selectAllHeader);
         selected.setPrefWidth(58);
         selected.setMinWidth(58);
         selected.setMaxWidth(72);
         selected.getStyleClass().add("center-column");
 
-        TableColumn<ProfileRow, String> os = textColumn("ОС", ProfileRow::osProperty, 64, true);
+        TableColumn<ProfileRow, String> os = osColumn("ОС", 64);
         os.getStyleClass().add("os-column");
         TableColumn<ProfileRow, String> name = textColumn("Название", ProfileRow::nameProperty, 260, false);
         TableColumn<ProfileRow, String> status = statusColumn("Статус", ProfileRow::statusProperty, 130);
@@ -195,12 +218,13 @@ public final class BrowserManagerFx extends Application {
     }
 
     private VBox buildBottom() {
-        CheckBox selectAll = new CheckBox("Выбрать все");
-        selectAll.selectedProperty().addListener((_obs, _old, value) -> profiles.forEach(row -> row.setSelected(value)));
+        selectedCountLabel = new Label("Выбрано: 0");
+        selectedCountLabel.getStyleClass().add("selected-count");
 
-        Button start = button("Запуск", () -> runAction("Запуск", () -> api.start(selectedIds())));
-        start.getStyleClass().add("accent-button");
-        Button stop = button("Стоп", () -> runAction("Стоп", () -> api.stop(selectedIds())));
+        Button start = button("ЗАПУСК", () -> runAction("Запуск", () -> api.start(selectedIds())));
+        start.getStyleClass().add("start-button");
+        Button stop = button("СТОП", () -> runAction("Стоп", () -> api.stop(selectedIds())));
+        stop.getStyleClass().add("stop-button");
         Button fingerprint = button("Fingerprint", () -> runAction("Fingerprint", () -> api.randomFingerprint(selectedIds())));
         Button cookies = button("Обновить", this::refreshProfiles);
         Button randomProxy = button("Случайный прокси", () -> runAction("Proxy", () -> api.randomProxy(selectedIds())));
@@ -211,7 +235,7 @@ public final class BrowserManagerFx extends Application {
             }
         });
 
-        HBox actions = new HBox(10, selectAll, start, stop, fingerprint, randomProxy, cookies, settings);
+        HBox actions = new HBox(10, selectedCountLabel, start, stop, fingerprint, randomProxy, cookies, settings);
         actions.setAlignment(Pos.CENTER_LEFT);
         actions.setPadding(new Insets(10, 16, 10, 16));
         actions.getStyleClass().add("action-bar");
@@ -235,6 +259,46 @@ public final class BrowserManagerFx extends Application {
         column.setPrefWidth(width);
         column.getStyleClass().add(centered ? "center-column" : "left-column");
         return column;
+    }
+
+    private TableColumn<ProfileRow, String> osColumn(String title, double width) {
+        TableColumn<ProfileRow, String> column = textColumn(title, ProfileRow::osProperty, width, true);
+        column.setCellFactory(_col -> new TableCell<>() {
+            @Override
+            protected void updateItem(String item, boolean empty) {
+                super.updateItem(item, empty);
+                if (empty || item == null || item.isBlank()) {
+                    setGraphic(null);
+                    setText(null);
+                    return;
+                }
+                setGraphic(osGraphic(item));
+                setText(null);
+                setAlignment(Pos.CENTER);
+            }
+        });
+        return column;
+    }
+
+    private Pane osGraphic(String kind) {
+        String normalized = kind.toLowerCase();
+        if (normalized.contains("windows")) {
+            GridPane logo = new GridPane();
+            logo.getStyleClass().add("windows-logo");
+            logo.setHgap(2);
+            logo.setVgap(2);
+            for (int row = 0; row < 2; row++) {
+                for (int column = 0; column < 2; column++) {
+                    Rectangle tile = new Rectangle(6, 6);
+                    tile.getStyleClass().add("windows-logo-tile");
+                    logo.add(tile, column, row);
+                }
+            }
+            return logo;
+        }
+        Label label = new Label(normalized.contains("mac") ? "mac" : "linux");
+        label.getStyleClass().add("os-text-icon");
+        return new StackPane(label);
     }
 
     private TableColumn<ProfileRow, String> proxyColumn(String title, double width) {
@@ -295,6 +359,7 @@ public final class BrowserManagerFx extends Application {
             case "ok" -> "proxy-check-ok";
             case "blocked" -> "proxy-check-blocked";
             case "fail" -> "proxy-check-fail";
+            case "unknown" -> "proxy-check-muted";
             default -> "proxy-check-muted";
         };
     }
@@ -451,13 +516,30 @@ public final class BrowserManagerFx extends Application {
             for (ProfileRow row : profiles) {
                 selected.put(row.getId(), row.isSelected());
             }
-            rows.forEach(row -> row.setSelected(Boolean.TRUE.equals(selected.get(row.getId()))));
+            rows.forEach(row -> {
+                row.setSelected(Boolean.TRUE.equals(selected.get(row.getId())));
+                row.selectedProperty().addListener((_obs, _old, _value) -> updateSelectionCount());
+            });
             profiles.setAll(rows);
+            updateSelectionCount();
             statusLabel.setText("Профилей: " + profiles.size());
         })).exceptionally(exc -> {
             Platform.runLater(() -> statusLabel.setText("Ошибка обновления: " + rootMessage(exc)));
             return null;
         });
+    }
+
+    private void updateSelectionCount() {
+        long selected = profiles.stream().filter(ProfileRow::isSelected).count();
+        if (selectedCountLabel != null) {
+            selectedCountLabel.setText("Выбрано: " + selected);
+        }
+        if (selectAllHeader != null) {
+            updatingSelectionHeader = true;
+            selectAllHeader.setIndeterminate(selected > 0 && selected < profiles.size());
+            selectAllHeader.setSelected(!profiles.isEmpty() && selected == profiles.size());
+            updatingSelectionHeader = false;
+        }
     }
 
     private void runAction(String label, ThrowingRunnable action) {
@@ -510,6 +592,201 @@ public final class BrowserManagerFx extends Application {
             dialog.showAndWait().filter(save::equals).ifPresent(_button -> runAction("Proxy pool", () -> api.saveProxies(area.getText())));
         })).exceptionally(exc -> {
             Platform.runLater(() -> showError("Proxy pool", rootMessage(exc)));
+            return null;
+        });
+    }
+
+    private void showNewProfileDialog() {
+        if (shell == null) {
+            return;
+        }
+
+        StackPane overlay = new StackPane();
+        overlay.getStyleClass().add("modal-overlay");
+
+        TextField name = modalField("Профиль " + (profiles.size() + 1), "Название профиля");
+        TextField folder = modalField(createProfileFolder(), "Папка");
+        TextField tags = modalField("", "Теги");
+        TextField startUrl = modalField("https://browserleaks.com/ip", "Стартовая страница");
+        TextField browserPath = modalField("", "Путь браузера");
+        TextField localPort = modalField("", "Локальный порт");
+        TextField proxyType = modalField("http", "http / socks5");
+        TextField proxyHost = modalField("", "Host");
+        TextField proxyPort = modalField("", "Port");
+        TextField proxyLogin = modalField("", "Login");
+        TextField proxyPassword = modalField("", "Password");
+
+        Label nameSummary = new Label();
+        Label folderSummary = new Label();
+        Label proxySummary = new Label();
+        Label platformSummary = new Label("Windows");
+        Label portSummary = new Label("авто");
+
+        Runnable updateSummary = () -> {
+            nameSummary.setText(name.getText().isBlank() ? "Новый профиль" : name.getText().trim());
+            folderSummary.setText(folder.getText().isBlank() ? DEFAULT_FOLDER : folder.getText().trim());
+            proxySummary.setText(proxyPreview(proxyType.getText(), proxyHost.getText(), proxyPort.getText(), proxyLogin.getText()));
+            portSummary.setText(localPort.getText().isBlank() ? "авто" : localPort.getText().trim());
+        };
+        List.of(name, folder, proxyType, proxyHost, proxyPort, proxyLogin, localPort).forEach(field ->
+                field.textProperty().addListener((_obs, _old, _value) -> updateSummary.run()));
+        updateSummary.run();
+
+        Label title = new Label("Новый профиль");
+        title.getStyleClass().add("modal-title");
+        Label tab = new Label("Основное");
+        tab.getStyleClass().add("modal-tab-active");
+        Button close = button("×", () -> closeModal(overlay));
+        close.getStyleClass().add("modal-close-button");
+        HBox header = new HBox(16, title, spacer(), close);
+        header.setAlignment(Pos.CENTER_LEFT);
+
+        HBox tabs = new HBox(22, tab);
+        tabs.getStyleClass().add("modal-tabs");
+
+        GridPane form = new GridPane();
+        form.getStyleClass().add("modal-form");
+        form.setHgap(14);
+        form.setVgap(12);
+        addModalField(form, 0, 0, "Название профиля", name);
+        addModalField(form, 0, 1, "Папка", folder);
+        addModalField(form, 1, 0, "Теги", tags);
+        addModalField(form, 1, 1, "Стартовая страница", startUrl);
+        addModalField(form, 2, 0, "Путь браузера", browserPath);
+        addModalField(form, 2, 1, "Локальный порт", localPort);
+        addModalField(form, 3, 0, "Тип прокси", proxyType);
+        addModalField(form, 3, 1, "Host", proxyHost);
+        addModalField(form, 4, 0, "Port", proxyPort);
+        addModalField(form, 4, 1, "Login", proxyLogin);
+        addModalField(form, 5, 0, "Password", proxyPassword);
+
+        VBox summary = new VBox(
+                14,
+                new Label("СВОДКА"),
+                summaryLine("Название", nameSummary),
+                summaryLine("Папка", folderSummary),
+                summaryLine("Платформа", platformSummary),
+                summaryLine("Прокси", proxySummary),
+                summaryLine("Лок. порт", portSummary)
+        );
+        summary.getStyleClass().add("modal-summary");
+
+        HBox body = new HBox(24, form, summary);
+        body.getStyleClass().add("modal-body");
+        HBox.setHgrow(form, Priority.ALWAYS);
+
+        Button cancel = button("ОТМЕНА", () -> closeModal(overlay));
+        cancel.getStyleClass().add("modal-cancel-button");
+        Button create = button("СОЗДАТЬ ПРОФИЛЬ", () -> createProfileFromDialog(
+                overlay,
+                name,
+                folder,
+                tags,
+                startUrl,
+                browserPath,
+                localPort,
+                proxyType,
+                proxyHost,
+                proxyPort,
+                proxyLogin,
+                proxyPassword
+        ));
+        create.getStyleClass().add("modal-create-button");
+        HBox footer = new HBox(14, spacer(), cancel, create);
+        footer.setAlignment(Pos.CENTER_RIGHT);
+        footer.getStyleClass().add("modal-footer");
+
+        VBox card = new VBox(14, header, tabs, body, footer);
+        card.getStyleClass().add("profile-modal");
+        overlay.getChildren().add(card);
+        StackPane.setMargin(card, new Insets(24));
+        shell.getChildren().add(overlay);
+        name.requestFocus();
+    }
+
+    private Region spacer() {
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        return spacer;
+    }
+
+    private TextField modalField(String value, String prompt) {
+        TextField field = field(value);
+        field.setPromptText(prompt);
+        field.getStyleClass().add("modal-field");
+        return field;
+    }
+
+    private void addModalField(GridPane grid, int row, int column, String label, TextField field) {
+        VBox box = new VBox(5, new Label(label), field);
+        box.getStyleClass().add("modal-field-box");
+        grid.add(box, column, row);
+        GridPane.setHgrow(box, Priority.ALWAYS);
+    }
+
+    private HBox summaryLine(String title, Label value) {
+        Label key = new Label(title);
+        key.getStyleClass().add("summary-key");
+        value.getStyleClass().add("summary-value");
+        HBox line = new HBox(14, key, value);
+        line.setAlignment(Pos.TOP_LEFT);
+        return line;
+    }
+
+    private String proxyPreview(String type, String host, String port, String login) {
+        if (host == null || host.isBlank() || port == null || port.isBlank()) {
+            return "Без прокси";
+        }
+        String auth = login == null || login.isBlank() ? "" : login.trim() + ":***@";
+        String scheme = type == null || type.isBlank() ? "http" : type.trim().toLowerCase();
+        return scheme + "://" + auth + host.trim() + ":" + port.trim();
+    }
+
+    private void closeModal(StackPane overlay) {
+        shell.getChildren().remove(overlay);
+    }
+
+    private void createProfileFromDialog(
+            StackPane overlay,
+            TextField name,
+            TextField folder,
+            TextField tags,
+            TextField startUrl,
+            TextField browserPath,
+            TextField localPort,
+            TextField proxyType,
+            TextField proxyHost,
+            TextField proxyPort,
+            TextField proxyLogin,
+            TextField proxyPassword
+    ) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("name", name.getText());
+        payload.put("folder", folder.getText());
+        payload.put("notes", tags.getText());
+        payload.put("start_url", startUrl.getText());
+        payload.put("browser_path", browserPath.getText());
+        payload.put("local_port", localPort.getText());
+        payload.put("proxy_type", proxyType.getText());
+        payload.put("proxy_host", proxyHost.getText());
+        payload.put("proxy_port", proxyPort.getText());
+        payload.put("proxy_login", proxyLogin.getText());
+        payload.put("proxy_password", proxyPassword.getText());
+
+        statusLabel.setText("Создание профиля...");
+        CompletableFuture.runAsync(() -> {
+            try {
+                api.createProfile(payload);
+            } catch (Exception exc) {
+                throw new RuntimeException(exc);
+            }
+        }, executor).thenRun(() -> Platform.runLater(() -> {
+            closeModal(overlay);
+            selectedFolder = folder.getText().isBlank() ? DEFAULT_FOLDER : folder.getText().trim();
+            refreshFolders();
+            refreshProfiles();
+        })).exceptionally(exc -> {
+            Platform.runLater(() -> showError("Создание профиля", rootMessage(exc)));
             return null;
         });
     }

@@ -32,7 +32,7 @@ public final class ProfileRow {
         id.set(Json.string(map.get("id")));
         name.set(Json.string(map.get("name")));
         folder.set(Json.string(map.get("folder")).isBlank() ? "BrowserManager" : Json.string(map.get("folder")));
-        os.set(osIcon(Json.asMap(map.get("fingerprint"))));
+        os.set(osKind(Json.asMap(map.get("fingerprint"))));
         status.set(Json.string(map.get("status")));
         tags.set(Json.string(map.get("notes")).isBlank() ? "теги" : Json.string(map.get("notes")));
         proxy.set(Json.string(map.get("proxy_label")));
@@ -41,16 +41,16 @@ public final class ProfileRow {
         localPort.set(Json.string(map.get("local_port")).isBlank() ? "авто" : Json.string(map.get("local_port")));
     }
 
-    private String osIcon(Map<String, Object> fingerprint) {
+    private String osKind(Map<String, Object> fingerprint) {
         String platform = Json.string(fingerprint.get("platform")).toLowerCase();
         String userAgent = Json.string(fingerprint.get("user_agent")).toLowerCase();
         if (platform.contains("mac") || userAgent.contains("macintosh")) {
-            return "⌘";
+            return "mac";
         }
         if (platform.contains("linux") || userAgent.contains("linux")) {
-            return "◆";
+            return "linux";
         }
-        return "⊞";
+        return "windows";
     }
 
     public String rawString(String key) {

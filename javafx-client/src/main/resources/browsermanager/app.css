@@ -4,6 +4,10 @@
     -fx-font-size: 12px;
 }
 
+.shell {
+    -fx-background-color: #181818;
+}
+
 .top-bar {
     -fx-background-color: #181818;
 }
@@ -30,6 +34,14 @@
     -fx-alignment: center-left;
     -fx-max-width: infinity;
     -fx-background-color: #1d3140;
+}
+
+.folder-divider {
+    -fx-min-height: 1px;
+    -fx-pref-height: 1px;
+    -fx-max-height: 1px;
+    -fx-max-width: infinity;
+    -fx-background-color: #2d3a45;
 }
 
 .folder-list {
@@ -86,6 +98,36 @@
 
 .accent-button:hover {
     -fx-background-color: #4aaeff;
+}
+
+.start-button {
+    -fx-background-color: #102015;
+    -fx-text-fill: #49c65d;
+    -fx-border-color: #31a64b;
+    -fx-border-width: 1;
+    -fx-border-radius: 4;
+    -fx-background-radius: 4;
+    -fx-font-weight: bold;
+    -fx-padding: 7 22 7 22;
+}
+
+.start-button:hover {
+    -fx-background-color: #142b1b;
+}
+
+.stop-button {
+    -fx-background-color: #241112;
+    -fx-text-fill: #ff4f45;
+    -fx-border-color: #f04438;
+    -fx-border-width: 1;
+    -fx-border-radius: 4;
+    -fx-background-radius: 4;
+    -fx-font-weight: bold;
+    -fx-padding: 7 24 7 24;
+}
+
+.stop-button:hover {
+    -fx-background-color: #321516;
 }
 
 .profile-table {
@@ -199,6 +241,20 @@
     -fx-font-weight: bold;
 }
 
+.windows-logo {
+    -fx-padding: 1;
+}
+
+.windows-logo-tile {
+    -fx-fill: #2d9dfb;
+}
+
+.os-text-icon {
+    -fx-text-fill: #dbe9f4;
+    -fx-font-size: 10px;
+    -fx-font-weight: bold;
+}
+
 .proxy-text {
     -fx-text-fill: #ffffff;
 }
@@ -273,6 +329,19 @@
     -fx-border-radius: 7;
 }
 
+.selected-count {
+    -fx-text-fill: #d6e7f5;
+    -fx-padding: 7 14 7 0;
+    -fx-font-weight: bold;
+}
+
+.table-select-all .box {
+    -fx-min-width: 15px;
+    -fx-min-height: 15px;
+    -fx-pref-width: 15px;
+    -fx-pref-height: 15px;
+}
+
 .check-box {
     -fx-text-fill: #c8d7e2;
 }
@@ -309,4 +378,120 @@
     -fx-border-color: #444444;
     -fx-border-width: 1 0 0 0;
     -fx-padding: 4 0 0 0;
+}
+
+.modal-overlay {
+    -fx-background-color: rgba(0, 0, 0, 0.58);
+    -fx-padding: 30;
+}
+
+.profile-modal {
+    -fx-background-color: #1f1f1f;
+    -fx-background-radius: 18;
+    -fx-border-color: #2b2f34;
+    -fx-border-radius: 18;
+    -fx-border-width: 1;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.65), 34, 0.35, 0, 14);
+    -fx-padding: 32 40 26 40;
+    -fx-max-width: 1040px;
+}
+
+.modal-title {
+    -fx-text-fill: #ffffff;
+    -fx-font-size: 27px;
+    -fx-font-weight: bold;
+}
+
+.modal-close-button {
+    -fx-background-color: #2a2d31;
+    -fx-text-fill: #aeb8c2;
+    -fx-min-width: 34px;
+    -fx-pref-width: 34px;
+    -fx-padding: 6 0 6 0;
+}
+
+.modal-tabs {
+    -fx-border-color: transparent transparent #3a3a3a transparent;
+    -fx-border-width: 0 0 1 0;
+}
+
+.modal-tab-active {
+    -fx-text-fill: #2d9dfb;
+    -fx-font-size: 16px;
+    -fx-font-weight: bold;
+    -fx-padding: 0 0 10 0;
+    -fx-border-color: transparent transparent #2d9dfb transparent;
+    -fx-border-width: 0 0 2 0;
+}
+
+.modal-body {
+    -fx-padding: 18 0 12 0;
+}
+
+.modal-form {
+    -fx-min-width: 610px;
+}
+
+.modal-field-box .label {
+    -fx-text-fill: #95a1ab;
+    -fx-font-size: 11px;
+}
+
+.modal-field {
+    -fx-background-color: #252525;
+    -fx-text-fill: #ffffff;
+    -fx-prompt-text-fill: #737d86;
+    -fx-border-color: #3c4248;
+    -fx-border-radius: 4;
+    -fx-background-radius: 4;
+    -fx-padding: 9 11 9 11;
+    -fx-min-width: 270px;
+}
+
+.modal-field:focused {
+    -fx-border-color: #2d9dfb;
+}
+
+.modal-summary {
+    -fx-background-color: #2a2a2a;
+    -fx-background-radius: 9;
+    -fx-padding: 24;
+    -fx-min-width: 300px;
+    -fx-max-width: 320px;
+}
+
+.modal-summary > .label {
+    -fx-text-fill: #ffffff;
+    -fx-font-size: 16px;
+    -fx-font-weight: bold;
+}
+
+.summary-key {
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+    -fx-min-width: 82px;
+}
+
+.summary-value {
+    -fx-text-fill: #aeb8c2;
+    -fx-wrap-text: true;
+}
+
+.modal-footer {
+    -fx-border-color: #3a3a3a transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+    -fx-padding: 18 0 0 0;
+}
+
+.modal-cancel-button {
+    -fx-background-color: transparent;
+    -fx-text-fill: #aeb8c2;
+    -fx-font-weight: bold;
+}
+
+.modal-create-button {
+    -fx-background-color: #2d9dfb;
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+    -fx-padding: 10 22 10 22;
 }

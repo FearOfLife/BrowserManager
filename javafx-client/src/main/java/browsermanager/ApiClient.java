@@ -77,6 +77,10 @@ public final class ApiClient {
         post("/api/profiles", Map.of("folder", folder == null ? "" : folder));
     }
 
+    public void createProfile(Map<String, Object> profile) throws IOException, InterruptedException {
+        post("/api/profiles", profile);
+    }
+
     public void createFolder(String name) throws IOException, InterruptedException {
         post("/api/folders", Map.of("name", name));
     }

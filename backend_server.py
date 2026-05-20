@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import random
 import socket
+import ssl
 import threading
 import time
 import uuid
@@ -13,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlparse
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 import browser_manager as core
 
@@ -21,18 +23,11 @@ import browser_manager as core
 DEFAULT_FOLDER = getattr(core, "DEFAULT_FOLDER", "BrowserManager")
 ALL_FOLDERS = "Все профили"
 FOLDERS_FILE = getattr(core, "FOLDERS_FILE", core.DATA_DIR / "folders.json")
-PROXY_CHECK_TARGETS = (
+PROXY_IP_TARGETS = (
     ("ipify", "https://api.ipify.org?format=json"),
-    ("cloudflare", "https://www.cloudflare.com/cdn-cgi/trace"),
-    ("google", "https://www.google.com/generate_204"),
-    ("browserleaks", "https://browserleaks.com/ip"),
+    ("icanhazip", "https://icanhazip.com"),
 )
-SOCKS_CHECK_TARGETS = (
-    ("google", "www.google.com", 443),
-    ("cloudflare", "www.cloudflare.com", 443),
-    ("ipify", "api.ipify.org", 443),
-    ("browserleaks", "browserleaks.com", 443),
-)
+REPUTATION_SERVICE_COUNT = 3
 
 
 def normalize_folder(name: Any) -> str:
@@ -168,55 +163,65 @@ def check_profile_proxy(profile: core.BrowserProfile) -> dict[str, Any]:
             "state": "none",
             "label": "нет прокси",
             "passed": 0,
-            "blocked": len(PROXY_CHECK_TARGETS),
-            "total": len(PROXY_CHECK_TARGETS),
+            "blocked": 0,
+            "total": REPUTATION_SERVICE_COUNT,
             "latency_ms": 0,
             "detail": "Прокси не задан",
         }
 
     started = time.monotonic()
-    if profile.proxy_type.lower().strip() == "socks5":
-        passed, errors = check_socks5_proxy(profile)
-        total = len(SOCKS_CHECK_TARGETS)
-    else:
-        passed, errors = check_http_proxy(profile)
-        total = len(PROXY_CHECK_TARGETS)
-    blocked = max(total - passed, 0)
+    try:
+        ip = resolve_proxy_ip(profile)
+    except Exception as exc:
+        return {
+            "state": "fail",
+            "label": "ошибка",
+            "passed": 0,
+            "blocked": 0,
+            "total": REPUTATION_SERVICE_COUNT,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "detail": f"Прокси не отвечает: {exc}",
+        }
+
+    reputation = check_ip_reputation(ip)
     latency_ms = int((time.monotonic() - started) * 1000)
-    state = "ok" if blocked == 0 else ("blocked" if passed else "fail")
-    detail = "OK" if not errors else "; ".join(errors[:3])
+    state = reputation["state"]
+    label = reputation["label"]
+    detail = f"IP {ip}; {reputation['detail']}"
     return {
         "state": state,
-        "label": f"{blocked}/{total}",
-        "passed": passed,
-        "blocked": blocked,
-        "total": total,
+        "label": label,
+        "passed": reputation["checked"],
+        "blocked": reputation["signals"],
+        "total": REPUTATION_SERVICE_COUNT,
         "latency_ms": latency_ms,
         "detail": detail,
     }
 
 
-def check_http_proxy(profile: core.BrowserProfile) -> tuple[int, list[str]]:
+def resolve_proxy_ip(profile: core.BrowserProfile) -> str:
+    if profile.proxy_type.lower().strip() == "socks5":
+        return resolve_socks5_proxy_ip(profile)
+    return resolve_http_proxy_ip(profile)
+
+
+def resolve_http_proxy_ip(profile: core.BrowserProfile) -> str:
     proxy_url = proxy_url_for_check(profile)
     opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
-    passed = 0
     errors: list[str] = []
-    for name, url in PROXY_CHECK_TARGETS:
+    for name, url in PROXY_IP_TARGETS:
         try:
             request = Request(url, headers={"User-Agent": profile.fingerprint.user_agent})
             with opener.open(request, timeout=8) as response:
-                if 200 <= int(getattr(response, "status", 0)) < 400:
-                    response.read(128)
-                    passed += 1
-                else:
-                    errors.append(f"{name}: HTTP {getattr(response, 'status', 0)}")
+                raw = response.read(4096).decode("utf-8", errors="replace")
+                return parse_ip_response(raw)
         except HTTPError as exc:
             errors.append(f"{name}: HTTP {exc.code}")
         except URLError as exc:
             errors.append(f"{name}: {exc.reason}")
         except Exception as exc:
-            errors.append(f"{name}: {type(exc).__name__}")
-    return passed, errors
+            errors.append(f"{name}: {exc}")
+    raise RuntimeError("; ".join(errors[:2]) or "IP lookup failed")
 
 
 def proxy_url_for_check(profile: core.BrowserProfile) -> str:
@@ -226,21 +231,143 @@ def proxy_url_for_check(profile: core.BrowserProfile) -> str:
     return f"http://{auth}{profile.proxy_host.strip()}:{profile.proxy_port.strip()}"
 
 
-def check_socks5_proxy(profile: core.BrowserProfile) -> tuple[int, list[str]]:
-    passed = 0
+def resolve_socks5_proxy_ip(profile: core.BrowserProfile) -> str:
     errors: list[str] = []
-    for name, host, port in SOCKS_CHECK_TARGETS:
+    try:
+        raw = https_get_via_socks5(profile, "api.ipify.org", "/?format=json")
+        return parse_ip_response(raw)
+    except Exception as exc:
+        errors.append(f"ipify: {exc}")
+    raise RuntimeError("; ".join(errors))
+
+
+def parse_ip_response(raw: str) -> str:
+    text = raw.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            text = str(parsed.get("ip") or parsed.get("query") or "").strip()
+    except Exception:
+        text = text.splitlines()[0].strip() if text else ""
+    ipaddress.ip_address(text)
+    return text
+
+
+def check_ip_reputation(ip: str) -> dict[str, Any]:
+    checked = 0
+    signals: list[str] = []
+    risks: list[int] = []
+    errors: list[str] = []
+
+    try:
+        data = fetch_json(f"https://proxycheck.io/v2/{quote(ip)}?vpn=1&asn=1&risk=1")
+        info = data.get(ip, {}) if isinstance(data, dict) else {}
+        if info:
+            checked += 1
+            if str(info.get("proxy", "")).lower() == "yes":
+                signals.append(str(info.get("type") or "proxy").lower())
+            risk = int(str(info.get("risk") or "0"))
+            risks.append(risk)
+    except Exception as exc:
+        errors.append(f"proxycheck: {exc}")
+
+    try:
+        data = fetch_json(f"https://ipwho.is/{quote(ip)}?security=1")
+        if data.get("success", True) is not False:
+            checked += 1
+            security = data.get("security") if isinstance(data.get("security"), dict) else {}
+            for key in ("proxy", "vpn", "tor", "hosting"):
+                if security.get(key) is True:
+                    signals.append(key)
+    except Exception as exc:
+        errors.append(f"ipwho.is: {exc}")
+
+    try:
+        data = fetch_json(
+            f"http://ip-api.com/json/{quote(ip)}?fields=status,message,query,proxy,hosting,mobile,isp,as,country"
+        )
+        if data.get("status") == "success":
+            checked += 1
+            if data.get("proxy") is True:
+                signals.append("proxy")
+            if data.get("hosting") is True:
+                signals.append("hosting")
+    except Exception as exc:
+        errors.append(f"ip-api: {exc}")
+
+    unique_signals = sorted({signal for signal in signals if signal})
+    risk = max(risks or [0])
+    if unique_signals or risk >= 65:
+        label = f"risk {risk}" if risk else ",".join(unique_signals[:2])
+        state = "blocked"
+    elif checked > 0:
+        label = "OK"
+        state = "ok"
+    else:
+        label = "IP OK"
+        state = "unknown"
+    detail = ", ".join(unique_signals) if unique_signals else "чисто"
+    if checked == 0 and errors:
+        detail = "репутация не проверена: " + "; ".join(errors[:2])
+    return {"state": state, "label": label, "checked": checked, "signals": len(unique_signals), "risk": risk, "detail": detail}
+
+
+def fetch_json(url: str) -> dict[str, Any]:
+    request = Request(url, headers={"User-Agent": "BrowserManager/1.0"})
+    with urlopen(request, timeout=8) as response:
+        raw = response.read(16384).decode("utf-8", errors="replace")
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def https_get_via_socks5(profile: core.BrowserProfile, target_host: str, path: str) -> str:
+    raw = b""
+    with open_socks5_tunnel(profile, target_host, 443) as sock:
+        context = ssl.create_default_context()
+        with context.wrap_socket(sock, server_hostname=target_host) as tls:
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {target_host}\r\n"
+                "User-Agent: BrowserManager/1.0\r\n"
+                "Accept: application/json,text/plain\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            tls.sendall(request.encode("ascii"))
+            while True:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+    headers, _, body = raw.partition(b"\r\n\r\n")
+    if b"transfer-encoding: chunked" in headers.lower():
+        body = decode_chunked(body)
+    return body.decode("utf-8", errors="replace")
+
+
+def decode_chunked(body: bytes) -> bytes:
+    decoded = b""
+    cursor = 0
+    while cursor < len(body):
+        line_end = body.find(b"\r\n", cursor)
+        if line_end == -1:
+            break
+        size_raw = body[cursor:line_end].split(b";", 1)[0].strip()
         try:
-            socks5_connect(profile, host, port)
-            passed += 1
-        except Exception as exc:
-            errors.append(f"{name}: {exc}")
-    return passed, errors
+            size = int(size_raw, 16)
+        except ValueError:
+            break
+        cursor = line_end + 2
+        if size == 0:
+            break
+        decoded += body[cursor:cursor + size]
+        cursor += size + 2
+    return decoded or body
 
 
-def socks5_connect(profile: core.BrowserProfile, target_host: str, target_port: int) -> None:
+def open_socks5_tunnel(profile: core.BrowserProfile, target_host: str, target_port: int) -> socket.socket:
     proxy_port = int(profile.proxy_port.strip())
-    with socket.create_connection((profile.proxy_host.strip(), proxy_port), timeout=8) as sock:
+    sock = socket.create_connection((profile.proxy_host.strip(), proxy_port), timeout=8)
+    try:
         sock.settimeout(8)
         methods = [0, 2] if profile.proxy_login.strip() else [0]
         sock.sendall(bytes([5, len(methods), *methods]))
@@ -272,6 +399,10 @@ def socks5_connect(profile: core.BrowserProfile, target_host: str, target_port: 
         elif atyp == 4:
             recv_exact(sock, 16)
         recv_exact(sock, 2)
+        return sock
+    except Exception:
+        sock.close()
+        raise
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -341,8 +472,32 @@ class BrowserManagerHandler(BaseHTTPRequestHandler):
             if path == "/api/profiles":
                 with STATE.lock:
                     profile = STATE.store.make_default_profile()
-                    profile.name = str(body.get("name") or profile.name)
+                    for key in (
+                        "name",
+                        "proxy_type",
+                        "proxy_host",
+                        "proxy_port",
+                        "proxy_login",
+                        "proxy_password",
+                        "start_url",
+                        "browser_path",
+                        "local_port",
+                        "notes",
+                    ):
+                        if key in body:
+                            value = str(body.get(key) or "")
+                            if key == "name" and not value.strip():
+                                value = profile.name
+                            setattr(profile, key, value)
                     profile.folder = STATE.create_folder(str(body.get("folder") or DEFAULT_FOLDER))
+                    if isinstance(body.get("fingerprint"), dict):
+                        profile.fingerprint = core.Fingerprint(
+                            **{
+                                key: value
+                                for key, value in body["fingerprint"].items()
+                                if key in core.Fingerprint.__dataclass_fields__
+                            }
+                        )
                     STATE.store.add(profile)
                     STATE.refresh()
                     STATE.add_log(f"[{core.now_label()}] Профиль создан: {profile.name}")
