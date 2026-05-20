@@ -7,6 +7,7 @@ import re
 import shutil
 import threading
 import traceback
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -22,8 +23,11 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 PROFILES_DIR = DATA_DIR / "profiles"
 PROFILES_FILE = DATA_DIR / "profiles.json"
+FOLDERS_FILE = DATA_DIR / "folders.json"
 PROXY_POOL_FILE = DATA_DIR / "proxies.txt"
 COOKIE_FILE_NAME = "cookies.json"
+TABS_FILE_NAME = "tabs.json"
+DEFAULT_FOLDER = "BrowserManager"
 
 
 DEFAULT_USER_AGENTS = [
@@ -70,6 +74,19 @@ def profile_dir(profile_id: str) -> Path:
 
 def cookie_file(profile_id: str) -> Path:
     return profile_dir(profile_id) / COOKIE_FILE_NAME
+
+
+def tabs_file(profile_id: str) -> Path:
+    return profile_dir(profile_id) / TABS_FILE_NAME
+
+
+def restorable_tab_url(url: str) -> str:
+    url = str(url or "").strip()
+    if not url or url == "about:blank":
+        return ""
+    if url.startswith(("chrome://newtab", "chrome://new-tab-page", "edge://newtab")):
+        return ""
+    return url
 
 
 def normalize_proxy(proxy_type: str, host: str, port: str) -> str:
@@ -169,6 +186,7 @@ class Fingerprint:
 class BrowserProfile:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     name: str = "Новый профиль"
+    folder: str = DEFAULT_FOLDER
     proxy_type: str = "http"
     proxy_host: str = ""
     proxy_port: str = ""
@@ -317,6 +335,7 @@ class LegacyBrowserRuntime:
             launch_options: dict[str, Any] = {
                 "headless": False,
                 "args": args,
+                "ignore_default_args": ["--enable-automation"],
                 "viewport": {
                     "width": int(fp.viewport_width),
                     "height": int(fp.viewport_height),
@@ -419,6 +438,7 @@ class LegacyBrowserRuntime:
             f"--window-size={fp.viewport_width},{fp.viewport_height}",
             f"--lang={fp.locale}",
             "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
             "--no-first-run",
             "--no-default-browser-check",
         ]
@@ -438,6 +458,8 @@ class BrowserRuntime:
         self._tasks: Queue[tuple[str, Any, Queue[Any] | None]] = Queue()
         self._contexts: dict[str, Any] = {}
         self._states: dict[str, str] = {}
+        self._profile_names: dict[str, str] = {}
+        self._last_session_save: dict[str, float] = {}
         self._state_lock = threading.RLock()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
@@ -448,10 +470,21 @@ class BrowserRuntime:
 
     def start(self, profile: BrowserProfile) -> None:
         with self._state_lock:
-            if self._states.get(profile.id) in {"starting", "running", "stopping"}:
+            state = self._states.get(profile.id)
+        if state in {"starting", "stopping"}:
+            self.log(f"[{now_label()}] Уже запущен: {profile.name}")
+            return
+        if state == "running" and self._sync_context_alive(profile.id):
+            self.log(f"[{now_label()}] Уже запущен: {profile.name}")
+            return
+
+        with self._state_lock:
+            state = self._states.get(profile.id)
+            if state in {"starting", "running", "stopping"}:
                 self.log(f"[{now_label()}] Уже запущен: {profile.name}")
                 return
             self._states[profile.id] = "starting"
+            self._profile_names[profile.id] = profile.name
 
         self._tasks.put(("start", BrowserProfile.from_dict(profile.to_dict()), None))
 
@@ -462,6 +495,14 @@ class BrowserRuntime:
                 return
             self._states[profile_id] = "stopping"
         self._tasks.put(("stop", profile_id, None))
+
+    def _sync_context_alive(self, profile_id: str) -> bool:
+        response: Queue[Any] = Queue(maxsize=1)
+        self._tasks.put(("status", profile_id, response))
+        try:
+            return bool(response.get(timeout=2))
+        except Empty:
+            return True
 
     def stop_all_sync(self) -> None:
         response: Queue[Any] = Queue(maxsize=1)
@@ -487,8 +528,15 @@ class BrowserRuntime:
 
     def _worker_loop(self) -> None:
         playwright: Any = None
+        last_poll = 0.0
         while True:
-            action, payload, response = self._tasks.get()
+            try:
+                action, payload, response = self._tasks.get(timeout=0.35)
+            except Empty:
+                if playwright is not None and time.monotonic() - last_poll >= 0.7:
+                    self._poll_contexts()
+                    last_poll = time.monotonic()
+                continue
             if action == "shutdown":
                 self._shutdown_worker(playwright)
                 if response:
@@ -507,7 +555,7 @@ class BrowserRuntime:
                     if action == "start" and isinstance(payload, BrowserProfile):
                         self._clear_state(payload.id)
                     if response:
-                        response.put(cookie_file(str(payload)))
+                        response.put(cookie_file(payload if isinstance(payload, str) else str(payload)))
                     continue
 
             try:
@@ -515,8 +563,14 @@ class BrowserRuntime:
                     self._run_start(playwright, payload)
                 elif action == "stop" and isinstance(payload, str):
                     self._run_stop(payload)
+                elif action == "status" and isinstance(payload, str):
+                    alive = self._context_alive(payload)
+                    if not alive:
+                        self._mark_context_closed(payload)
+                    if response:
+                        response.put(alive)
                 elif action == "export" and isinstance(payload, str):
-                    path = self._run_export(payload)
+                    path = self._run_save_session(payload)
                     if response:
                         response.put(path)
             except Exception:
@@ -530,10 +584,13 @@ class BrowserRuntime:
 
     def _run_start(self, playwright: Any, profile: BrowserProfile) -> None:
         try:
+            self._profile_names[profile.id] = profile.name
             if profile.id in self._contexts:
-                self._set_state(profile.id, "running")
-                self.log(f"[{now_label()}] Уже запущен: {profile.name}")
-                return
+                if self._context_alive(profile.id):
+                    self._set_state(profile.id, "running")
+                    self.log(f"[{now_label()}] Уже запущен: {profile.name}")
+                    return
+                self._mark_context_closed(profile.id)
 
             data_dir = profile_dir(profile.id)
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -543,6 +600,7 @@ class BrowserRuntime:
             launch_options: dict[str, Any] = {
                 "headless": False,
                 "args": args,
+                "ignore_default_args": ["--enable-automation"],
                 "viewport": {
                     "width": int(fp.viewport_width),
                     "height": int(fp.viewport_height),
@@ -577,10 +635,8 @@ class BrowserRuntime:
             self._contexts[profile.id] = context
             self._set_state(profile.id, "running")
 
-            existing_pages = list(context.pages)
-            page = existing_pages[0] if existing_pages else context.new_page()
-            if profile.start_url.strip():
-                page.goto(profile.start_url.strip(), wait_until="domcontentloaded", timeout=45_000)
+            self._restore_tabs(context, profile)
+            self._run_save_session(profile.id, context=context)
 
             context.on("close", lambda: self._forget_context(profile.id))
             self.log(f"[{now_label()}] Браузер запущен: {profile.name}")
@@ -597,9 +653,9 @@ class BrowserRuntime:
             self.log(f"[{now_label()}] Профиль уже остановлен")
             return
         try:
-            target = self._run_export(profile_id, context=context)
+            target = self._run_save_session(profile_id, context=context)
             context.close()
-            self.log(f"[{now_label()}] Cookies сохранены: {target}")
+            self.log(f"[{now_label()}] Сессия сохранена: {target}")
             self.log(f"[{now_label()}] Браузер остановлен")
         except Exception:
             self.log(f"[{now_label()}] Ошибка остановки профиля")
@@ -608,15 +664,73 @@ class BrowserRuntime:
             self._clear_state(profile_id)
 
     def _run_export(self, profile_id: str, context: Any | None = None) -> Path:
+        return self._run_save_session(profile_id, context=context)
+
+    def _run_save_session(self, profile_id: str, context: Any | None = None) -> Path:
         context = context or self._contexts.get(profile_id)
-        target = cookie_file(profile_id)
+        cookie_target = cookie_file(profile_id)
         if not context:
-            return target
+            return cookie_target
         state = context.storage_state()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("w", encoding="utf-8") as fh:
+        cookie_target.parent.mkdir(parents=True, exist_ok=True)
+        with cookie_target.open("w", encoding="utf-8") as fh:
             json.dump(state.get("cookies", []), fh, ensure_ascii=False, indent=2)
-        return target
+        tab_urls: list[str] = []
+        for page in list(context.pages):
+            url = restorable_tab_url(getattr(page, "url", ""))
+            if url:
+                tab_urls.append(url)
+        with tabs_file(profile_id).open("w", encoding="utf-8") as fh:
+            json.dump(tab_urls, fh, ensure_ascii=False, indent=2)
+        self._last_session_save[profile_id] = time.monotonic()
+        return cookie_target
+
+    def _restore_tabs(self, context: Any, profile: BrowserProfile) -> None:
+        saved_tabs = self._load_saved_tabs(profile.id)
+        start_url = restorable_tab_url(profile.start_url.strip())
+        existing_pages = list(context.pages)
+        existing_urls = [url for url in (restorable_tab_url(getattr(page, "url", "")) for page in existing_pages) if url]
+
+        if existing_urls:
+            self.log(f"[{now_label()}] Вкладки оставлены из Chrome-профиля: {len(existing_urls)}")
+            return
+
+        urls = saved_tabs or ([start_url] if start_url else [])
+
+        if not urls:
+            if not existing_pages:
+                context.new_page()
+            return
+
+        primary_page = existing_pages[0] if existing_pages else context.new_page()
+        for extra_page in existing_pages[1:]:
+            try:
+                extra_page.close()
+            except Exception:
+                pass
+
+        opened = 0
+        for index, url in enumerate(urls):
+            page = primary_page if index == 0 else context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                opened += 1
+            except Exception as exc:
+                self.log(f"[{now_label()}] Вкладка не загрузилась: {url} ({exc})")
+        if saved_tabs:
+            self.log(f"[{now_label()}] Вкладки восстановлены: {opened}/{len(saved_tabs)}")
+
+    def _load_saved_tabs(self, profile_id: str) -> list[str]:
+        path = tabs_file(profile_id)
+        if not path.exists():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [url for url in (restorable_tab_url(item) for item in raw) if url]
 
     def _shutdown_worker(self, playwright: Any) -> None:
         for profile_id in list(self._contexts.keys()):
@@ -628,10 +742,48 @@ class BrowserRuntime:
                 pass
         with self._state_lock:
             self._states.clear()
+            self._profile_names.clear()
 
     def _forget_context(self, profile_id: str) -> None:
-        self._contexts.pop(profile_id, None)
+        self._mark_context_closed(profile_id)
+
+    def _poll_contexts(self) -> None:
+        for profile_id in list(self._contexts.keys()):
+            if not self._context_alive(profile_id):
+                self._mark_context_closed(profile_id)
+                continue
+            if time.monotonic() - self._last_session_save.get(profile_id, 0.0) >= 2.0:
+                try:
+                    self._run_save_session(profile_id)
+                except Exception:
+                    pass
+
+    def _context_alive(self, profile_id: str) -> bool:
+        context = self._contexts.get(profile_id)
+        if not context:
+            return False
+        try:
+            context.cookies()
+            return True
+        except Exception:
+            return False
+
+    def _mark_context_closed(self, profile_id: str) -> None:
+        context = self._contexts.pop(profile_id, None)
+        with self._state_lock:
+            state = self._states.get(profile_id)
+            name = self._profile_names.get(profile_id, profile_id)
+        if context is None and state not in {"starting", "running"}:
+            self._clear_state(profile_id)
+            return
+        if context is not None:
+            try:
+                self._run_save_session(profile_id, context=context)
+            except Exception:
+                pass
         self._clear_state(profile_id)
+        if state != "stopping":
+            self.log(f"[{now_label()}] Браузер закрыт пользователем: {name}")
 
     def _set_state(self, profile_id: str, state: str) -> None:
         with self._state_lock:
@@ -640,6 +792,8 @@ class BrowserRuntime:
     def _clear_state(self, profile_id: str) -> None:
         with self._state_lock:
             self._states.pop(profile_id, None)
+            self._profile_names.pop(profile_id, None)
+            self._last_session_save.pop(profile_id, None)
 
     def _load_cookies(self, context: Any, profile_id: str) -> None:
         path = cookie_file(profile_id)
@@ -672,6 +826,7 @@ class BrowserRuntime:
             f"--window-size={fp.viewport_width},{fp.viewport_height}",
             f"--lang={fp.locale}",
             "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
             "--no-first-run",
             "--no-default-browser-check",
         ]
@@ -1348,6 +1503,9 @@ class ManagerApp(tk.Tk):
         self.bulk_count_var = tk.StringVar(value="")
         self.profile_table: ttk.Treeview | None = None
         self.bulk_panel: tk.Frame | None = None
+        self.table_wrap: tk.Frame | None = None
+        self.table_separators: list[tk.Frame] = []
+        self.select_all_button: tk.Button | None = None
         self.log_text: tk.Text | None = None
 
         self._setup_style()
@@ -1386,55 +1544,27 @@ class ManagerApp(tk.Tk):
         self.option_add("*Text.Foreground", "#f5f5f5")
 
     def _build_ui(self) -> None:
-        shell = tk.Frame(self, bg="#181818")
-        shell.pack(fill=tk.BOTH, expand=True)
-        shell.columnconfigure(2, weight=1)
-        shell.rowconfigure(0, weight=1)
-
-        nav = tk.Frame(shell, width=46, bg="#101010")
-        nav.grid(row=0, column=0, sticky="ns")
-        nav.grid_propagate(False)
-        tk.Label(nav, text="B", bg="#8b3cf6", fg="#ffffff", font=("Segoe UI", 16, "bold")).pack(fill=tk.X, padx=8, pady=(10, 24))
-        for item in ("☰", "↔", "⚙", "?"):
-            tk.Label(nav, text=item, bg="#101010", fg="#9d9d9d", font=("Segoe UI", 13)).pack(pady=12)
-
-        side = tk.Frame(shell, width=205, bg="#202020")
-        side.grid(row=0, column=1, sticky="ns")
-        side.grid_propagate(False)
-        tk.Entry(side, relief=tk.FLAT, fg="#cfcfcf", insertbackground="#fff").pack(fill=tk.X, padx=12, pady=(12, 18), ipady=6)
-        tk.Label(side, text="Все профили", anchor="w", bg="#202020", fg="#ffffff", font=("Segoe UI", 9, "bold")).pack(fill=tk.X, padx=16)
-        tk.Label(side, text="📁 Default", anchor="w", bg="#202020", fg="#aeb8c2").pack(fill=tk.X, padx=22, pady=(18, 4))
-        tk.Label(side, text="📁 BrowserManager", anchor="w", bg="#203244", fg="#43a8ff").pack(fill=tk.X, padx=8, pady=4, ipady=8)
-
-        main = tk.Frame(shell, bg="#181818")
-        main.grid(row=0, column=2, sticky="nsew")
+        main = tk.Frame(self, bg="#181818", padx=14, pady=12)
+        main.pack(fill=tk.BOTH, expand=True)
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(2, weight=1)
+        main.rowconfigure(1, weight=1)
 
-        topbar = tk.Frame(main, bg="#121212", height=58)
+        topbar = tk.Frame(main, bg="#181818", height=46)
         topbar.grid(row=0, column=0, sticky="ew")
         topbar.grid_propagate(False)
-        tk.Label(topbar, text="📂  ПРОФИЛИ", bg="#121212", fg="#f5f5f5", font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT, padx=18)
-        self._bar_button(topbar, "Создать профиль", self.create_profile).pack(side=tk.RIGHT, padx=(6, 16), pady=12)
-        self._bar_button(topbar, "Прокси пул", self.open_proxy_pool_panel).pack(side=tk.RIGHT, padx=6, pady=12)
-        self._bar_button(topbar, "Быстрый профиль", self.duplicate_profile).pack(side=tk.RIGHT, padx=6, pady=12)
-
-        banner = tk.Frame(main, bg="#102231", height=56)
-        banner.grid(row=1, column=0, sticky="ew", padx=8, pady=(8, 0))
-        banner.grid_propagate(False)
-        tk.Label(
-            banner,
-            text="Proxy, cookies и fingerprint вынесены в панели управления профилями",
-            bg="#102231",
-            fg="#2fa8ff",
-            font=("Segoe UI", 10, "bold"),
-        ).pack(side=tk.LEFT, padx=22)
+        tk.Label(topbar, text="BrowserManager", bg="#181818", fg="#f5f5f5", font=("Segoe UI", 17, "bold")).pack(side=tk.LEFT)
+        tk.Label(topbar, text="профили браузеров", bg="#181818", fg="#8f98a3", font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(10, 0), pady=(7, 0))
+        self._bar_button(topbar, "Создать профиль", self.create_profile, accent=True).pack(side=tk.RIGHT, padx=(8, 0), pady=6)
+        self._bar_button(topbar, "Прокси пул", self.open_proxy_pool_panel).pack(side=tk.RIGHT, padx=(8, 0), pady=6)
+        self._bar_button(topbar, "Удалить", self.delete_profile).pack(side=tk.RIGHT, padx=(8, 0), pady=6)
+        self._bar_button(topbar, "Дублировать", self.duplicate_profile).pack(side=tk.RIGHT, padx=(8, 0), pady=6)
 
         table_wrap = tk.Frame(main, bg="#181818")
-        table_wrap.grid(row=2, column=0, sticky="nsew", padx=8, pady=(10, 0))
+        self.table_wrap = table_wrap
+        table_wrap.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         table_wrap.columnconfigure(0, weight=1)
         table_wrap.rowconfigure(0, weight=1)
-        columns = ("select", "platform", "name", "status", "tags", "proxy", "local_port", "actions")
+        columns = ("select", "platform", "name", "status", "tags", "proxy", "local_port")
         table = ttk.Treeview(table_wrap, columns=columns, show="headings", selectmode="browse")
         self.profile_table = table
         headings = {
@@ -1445,43 +1575,57 @@ class ManagerApp(tk.Tk):
             "tags": "Теги",
             "proxy": "Прокси",
             "local_port": "Лок. порт",
-            "actions": "",
         }
         widths = {
-            "select": 42,
+            "select": 66,
             "platform": 58,
             "name": 260,
             "status": 120,
             "tags": 130,
-            "proxy": 390,
+            "proxy": 440,
             "local_port": 110,
-            "actions": 48,
         }
         for col in columns:
-            table.heading(col, text=headings[col])
-            table.column(col, width=widths[col], minwidth=widths[col], anchor=tk.W if col not in {"select", "actions"} else tk.CENTER)
+            table.heading(col, text=headings[col], anchor=tk.CENTER)
+            table.column(col, width=widths[col], minwidth=widths[col], anchor=tk.W if col not in {"select"} else tk.CENTER)
         table.tag_configure("running", foreground="#6dff7a")
         table.tag_configure("stopped", foreground="#e8e8e8")
         table.grid(row=0, column=0, sticky="nsew")
         table.bind("<Button-1>", self.on_table_click)
         table.bind("<Double-1>", lambda _event: self.open_profile_settings())
+        table.bind("<Configure>", lambda _event: self._draw_table_separators())
         scroll = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=table.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         table.configure(yscrollcommand=scroll.set)
+        self.select_all_button = tk.Button(
+            table_wrap,
+            text="☐",
+            command=self.toggle_all_profiles,
+            bg="#161616",
+            fg="#ffffff",
+            activebackground="#243949",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            bd=0,
+            width=3,
+            font=("Segoe UI", 10, "bold"),
+        )
 
-        self.bulk_panel = tk.Frame(main, bg="#2d9dfb", bd=0)
-        self.bulk_panel.grid(row=3, column=0, pady=10)
-        tk.Label(self.bulk_panel, textvariable=self.bulk_count_var, bg="#58b5ff", fg="#ffffff", font=("Segoe UI", 11, "bold"), width=4).pack(side=tk.LEFT, padx=(8, 6), pady=8, ipady=7)
-        self._bulk_button("▶ Запуск", self.start_profiles).pack(side=tk.LEFT, padx=4, pady=8)
-        self._bulk_button("Ⅱ Стоп", self.stop_profiles).pack(side=tk.LEFT, padx=4, pady=8)
-        self._bulk_button("Fingerprint", lambda: self.open_fingerprint_panel()).pack(side=tk.LEFT, padx=4, pady=8)
+        self.bulk_panel = tk.Frame(main, bg="#1d3140", bd=0, padx=10, pady=8, highlightbackground="#2d4658", highlightthickness=1)
+        self.bulk_panel.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        tk.Label(self.bulk_panel, textvariable=self.bulk_count_var, bg="#1d3140", fg="#c8d7e2", font=("Segoe UI", 10), width=10, anchor="w").pack(side=tk.LEFT, padx=(0, 14), ipady=5)
+        self._bulk_button("Запуск", self.start_profiles, accent=True).pack(side=tk.LEFT, padx=4)
+        self._bulk_button("Стоп", self.stop_profiles).pack(side=tk.LEFT, padx=4)
+        self._bulk_separator().pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=4)
+        self._bulk_button("Fingerprint", self.randomize_action_fingerprints).pack(side=tk.LEFT, padx=4, pady=8)
         self._bulk_button("Cookies", lambda: self.open_cookie_panel()).pack(side=tk.LEFT, padx=4, pady=8)
-        self._bulk_button("Proxy random", lambda: self.assign_random_proxy_to_profiles()).pack(side=tk.LEFT, padx=4, pady=8)
-        self._bulk_button("⋯ Настройки", self.open_profile_settings).pack(side=tk.LEFT, padx=(4, 8), pady=8)
+        self._bulk_separator().pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=4)
+        self._bulk_button("Случайный proxy", lambda: self.assign_random_proxy_to_profiles()).pack(side=tk.LEFT, padx=4, pady=8)
+        self._bulk_button("Настройки", self.open_profile_settings).pack(side=tk.LEFT, padx=4, pady=8)
         self.bulk_panel.grid_remove()
 
         log_box = tk.Frame(main, bg="#181818")
-        log_box.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
+        log_box.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         tk.Label(log_box, text="Лог", bg="#181818", fg="#9b9b9b").pack(anchor="w")
         self.log_text = tk.Text(log_box, height=5, wrap=tk.WORD, relief=tk.FLAT, bg="#202020", fg="#eeeeee")
         self.log_text.pack(fill=tk.X, expand=False)
@@ -1489,11 +1633,62 @@ class ManagerApp(tk.Tk):
         status = tk.Label(self, textvariable=self.status_var, bg="#181818", fg="#cfcfcf", anchor="w", relief=tk.SUNKEN, bd=1)
         status.pack(fill=tk.X, side=tk.BOTTOM)
 
-    def _bar_button(self, parent: tk.Widget, text: str, command: Callable[[], None]) -> tk.Button:
-        return tk.Button(parent, text=text, command=command, bg="#2b2b2b", fg="#f5f5f5", activebackground="#353535", activeforeground="#ffffff", relief=tk.FLAT, padx=14)
+    def _bar_button(self, parent: tk.Widget, text: str, command: Callable[[], None], accent: bool = False) -> tk.Button:
+        bg = "#2d9dfb" if accent else "#2a2d31"
+        active = "#4aaeff" if accent else "#353a40"
+        return tk.Button(parent, text=text, command=command, bg=bg, fg="#f5f5f5", activebackground=active, activeforeground="#ffffff", relief=tk.FLAT, padx=14)
 
-    def _bulk_button(self, text: str, command: Callable[[], None]) -> tk.Button:
-        return tk.Button(self.bulk_panel, text=text, command=command, bg="#2d9dfb", fg="#ffffff", activebackground="#47adff", activeforeground="#ffffff", relief=tk.FLAT, padx=10)
+    def _bulk_button(self, text: str, command: Callable[[], None], accent: bool = False) -> tk.Button:
+        bg = "#28536c" if accent else "#243949"
+        active = "#346985" if accent else "#2d4658"
+        return tk.Button(self.bulk_panel, text=text, command=command, bg=bg, fg="#ffffff", activebackground=active, activeforeground="#ffffff", relief=tk.FLAT, padx=11, pady=5)
+
+    def _bulk_separator(self) -> tk.Frame:
+        return tk.Frame(self.bulk_panel, width=1, bg="#365365")
+
+    def _draw_table_separators(self) -> None:
+        if self.profile_table is None or self.table_wrap is None:
+            return
+        table = self.profile_table
+        for separator in self.table_separators:
+            separator.destroy()
+        self.table_separators = []
+        self.update_idletasks()
+        x = table.winfo_x()
+        y = table.winfo_y()
+        height = table.winfo_height()
+        columns = tuple(table["columns"])
+        row_ids = table.get_children()
+        first_row = row_ids[0] if row_ids else ""
+
+        if first_row:
+            boundaries = []
+            for column in columns[:-1]:
+                bbox = table.bbox(first_row, column)
+                if bbox:
+                    boundaries.append(x + bbox[0] + bbox[2])
+            select_bbox = table.bbox(first_row, "select")
+            select_x = x + select_bbox[0] if select_bbox else x
+            select_width = select_bbox[2] if select_bbox else int(table.column("select", "width"))
+        else:
+            boundaries = []
+            running_x = x
+            for column in columns[:-1]:
+                running_x += int(table.column(column, "width"))
+                boundaries.append(running_x)
+            select_x = x
+            select_width = int(table.column("select", "width"))
+
+        for boundary_x in boundaries:
+            separator = tk.Frame(self.table_wrap, bg="#2d3f4c", width=1)
+            separator.place(x=boundary_x, y=y, height=height)
+            separator.lift()
+            self.table_separators.append(separator)
+        if self.select_all_button is not None:
+            button_width = 27
+            button_height = 22
+            self.select_all_button.place(x=select_x + max(0, (select_width - button_width) // 2), y=y + 6, width=button_width, height=button_height)
+            self.select_all_button.lift()
 
     def refresh_profile_table(self) -> None:
         if self.profile_table is None:
@@ -1514,21 +1709,31 @@ class ManagerApp(tk.Tk):
                     profile.notes.strip() or "теги",
                     proxy_label(profile),
                     profile.local_port.strip() or "авто",
-                    "⋯",
                 ),
                 tags=("running" if running else "stopped",),
             )
         if self.selected_profile_id and self.selected_profile_id in table.get_children():
             table.selection_set(self.selected_profile_id)
             table.focus(self.selected_profile_id)
+        if self.select_all_button is not None:
+            all_selected = bool(self.profiles) and len(self.checked_profile_ids) == len(self.profiles)
+            self.select_all_button.configure(text="☑" if all_selected else "☐")
         self.refresh_bulk_panel()
+        self.after_idle(self._draw_table_separators)
+
+    def toggle_all_profiles(self) -> None:
+        if self.profiles and len(self.checked_profile_ids) == len(self.profiles):
+            self.checked_profile_ids.clear()
+        else:
+            self.checked_profile_ids = {profile.id for profile in self.profiles}
+        self.refresh_profile_table()
 
     def refresh_bulk_panel(self) -> None:
         if self.bulk_panel is None:
             return
         count = len(self.checked_profile_ids)
         if count:
-            self.bulk_count_var.set(str(count))
+            self.bulk_count_var.set(f"{count} выбрано")
             self.bulk_panel.grid()
         else:
             self.bulk_panel.grid_remove()
@@ -1550,9 +1755,6 @@ class ManagerApp(tk.Tk):
             else:
                 self.checked_profile_ids.add(row_id)
             self.refresh_profile_table()
-            return "break"
-        if column == "#8":
-            self.open_profile_settings(self.store.get(row_id))
             return "break"
         profile = self.store.get(row_id)
         if profile:
@@ -1637,6 +1839,17 @@ class ManagerApp(tk.Tk):
         self.store.save()
         self.start_profiles()
 
+    def randomize_action_fingerprints(self, profiles: list[BrowserProfile] | None = None) -> None:
+        targets = profiles or self.action_profiles()
+        if not targets:
+            messagebox.showinfo("Нет профилей", "Выберите профили для рандомизации fingerprint.", parent=self)
+            return
+        for profile in targets:
+            profile.fingerprint = self.random_fingerprint()
+        self.store.save()
+        self.refresh_profile_table()
+        self.enqueue_log(f"[{now_label()}] Fingerprint рандомизирован отдельно для {len(targets)} профилей")
+
     def load_proxy_pool(self) -> list[str]:
         if not PROXY_POOL_FILE.exists():
             return []
@@ -1699,21 +1912,26 @@ class ManagerApp(tk.Tk):
         profile = profile or self.selected_profile()
         if not profile:
             return
-        win, panel = self._modal(f"Редактировать профиль {profile.name}", 960, 620)
+        win, panel = self._modal(f"Редактировать профиль {profile.name}", 920, 600)
         top = tk.Frame(panel, bg="#1f1f1f")
         top.pack(fill=tk.X)
         tk.Label(top, text=f"Редактировать профиль {profile.name}", bg="#1f1f1f", fg="#ffffff", font=("Segoe UI", 20, "bold")).pack(side=tk.LEFT)
-        self._bar_button(top, "×", win.destroy).pack(side=tk.RIGHT)
+
+        footer = tk.Frame(panel, bg="#1b1b1b", pady=10)
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
 
         body = tk.Frame(panel, bg="#1f1f1f")
-        body.pack(fill=tk.BOTH, expand=True, pady=(18, 0))
+        body.pack(fill=tk.BOTH, expand=True, pady=(16, 12))
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=0)
 
         left = tk.Frame(body, bg="#1f1f1f")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
-        right = tk.Frame(body, bg="#292929", padx=18, pady=18)
+        left.grid(row=0, column=0, sticky="new", padx=(0, 18))
+        left.columnconfigure(1, weight=1)
+        left.columnconfigure(3, weight=1)
+        right = tk.Frame(body, bg="#292929", padx=16, pady=16, width=240)
         right.grid(row=0, column=1, sticky="ns")
+        right.grid_propagate(False)
 
         vars_: dict[str, tk.Variable] = {
             "name": tk.StringVar(value=profile.name),
@@ -1736,12 +1954,12 @@ class ManagerApp(tk.Tk):
         self._field(left, "Теги", vars_["notes"], 3, 2, width=24)
 
         tk.Label(left, text="Прокси", bg="#1f1f1f", fg="#ffffff", font=("Segoe UI", 12, "bold")).grid(row=4, column=0, sticky="w", pady=(18, 6))
-        ttk.Combobox(left, values=("http", "socks5"), textvariable=vars_["proxy_type"], width=10, state="readonly").grid(row=5, column=0, sticky="w", pady=4)
-        self._field(left, "Host", vars_["proxy_host"], 5, 1, width=24)
-        self._field(left, "Port", vars_["proxy_port"], 5, 3, width=10)
-        self._field(left, "Login", vars_["proxy_login"], 6, 0, width=24)
-        self._field(left, "Password", vars_["proxy_password"], 6, 2, width=24, show="*")
-        self._field(left, "Строка proxy", vars_["proxy_line"], 7, 0, colspan=2)
+        ttk.Combobox(left, values=("http", "socks5"), textvariable=vars_["proxy_type"], width=12, state="readonly").grid(row=5, column=0, sticky="w", pady=(4, 10))
+        self._field(left, "Host", vars_["proxy_host"], 6, 0, width=24)
+        self._field(left, "Port", vars_["proxy_port"], 6, 2, width=10)
+        self._field(left, "Login", vars_["proxy_login"], 7, 0, width=24)
+        self._field(left, "Password", vars_["proxy_password"], 7, 2, width=24, show="*")
+        self._field(left, "Строка proxy", vars_["proxy_line"], 8, 0, colspan=3)
 
         def parse_proxy() -> None:
             proxy_type, host, port, login, password = split_proxy(vars_["proxy_line"].get())
@@ -1751,11 +1969,11 @@ class ManagerApp(tk.Tk):
             vars_["proxy_login"].set(login)
             vars_["proxy_password"].set(password)
 
-        self._bar_button(left, "Разобрать", parse_proxy).grid(row=7, column=3, sticky="w", padx=8)
+        self._bar_button(left, "Разобрать", parse_proxy).grid(row=8, column=4, sticky="w", padx=8)
 
         tools = tk.Frame(left, bg="#1f1f1f")
-        tools.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(18, 0))
-        self._bar_button(tools, "Fingerprint", lambda: self.open_fingerprint_panel([profile])).pack(side=tk.LEFT, padx=(0, 8))
+        tools.grid(row=9, column=0, columnspan=5, sticky="ew", pady=(18, 0))
+        self._bar_button(tools, "Fingerprint", lambda: self.open_personal_fingerprint_panel(profile)).pack(side=tk.LEFT, padx=(0, 8))
         self._bar_button(tools, "Cookies", lambda: self.open_cookie_panel([profile])).pack(side=tk.LEFT, padx=8)
         self._bar_button(tools, "Рандом proxy", lambda: self.assign_random_proxy_to_profiles([profile])).pack(side=tk.LEFT, padx=8)
 
@@ -1765,16 +1983,18 @@ class ManagerApp(tk.Tk):
             ("Название", profile.name),
             ("Прокси", proxy_label(profile)),
             ("Порт", profile.local_port or "авто"),
+            ("Платформа", profile.fingerprint.platform),
             ("UserAgent", profile.fingerprint.user_agent[:48] + "..."),
             ("Timezone", profile.fingerprint.timezone),
+            ("Экран", f"{profile.fingerprint.screen_width}x{profile.fingerprint.screen_height}"),
+            ("Viewport", f"{profile.fingerprint.viewport_width}x{profile.fingerprint.viewport_height}"),
+            ("CPU / RAM", f"{profile.fingerprint.hardware_concurrency} / {profile.fingerprint.device_memory} GB"),
+            ("WebGL", profile.fingerprint.webgl_vendor),
             ("Canvas", "noise" if profile.fingerprint.canvas_noise else "real"),
             ("WebRTC", "protected" if profile.fingerprint.webrtc_protection else "default"),
         ):
             tk.Label(right, text=label, bg="#292929", fg="#ffffff", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
-            tk.Label(right, text=value, bg="#292929", fg="#bdbdbd", wraplength=260, justify=tk.LEFT).pack(anchor="w")
-
-        footer = tk.Frame(panel, bg="#1b1b1b", pady=12)
-        footer.pack(fill=tk.X, side=tk.BOTTOM)
+            tk.Label(right, text=value, bg="#292929", fg="#bdbdbd", wraplength=205, justify=tk.LEFT).pack(anchor="w")
 
         def save() -> None:
             profile.name = vars_["name"].get().strip() or "Без имени"
@@ -1795,7 +2015,13 @@ class ManagerApp(tk.Tk):
         self._bar_button(footer, "Отмена", win.destroy).pack(side=tk.RIGHT, padx=8)
         self._bar_button(footer, "✓ Сохранить", save).pack(side=tk.RIGHT, padx=8)
 
-    def open_fingerprint_panel(self, profiles: list[BrowserProfile] | None = None) -> None:
+    def open_personal_fingerprint_panel(self, profile: BrowserProfile) -> None:
+        self.open_fingerprint_panel([profile], personal=True)
+
+    def open_fingerprint_panel(self, profiles: list[BrowserProfile] | None = None, personal: bool = False) -> None:
+        if not personal:
+            self.randomize_action_fingerprints(profiles)
+            return
         targets = profiles or self.action_profiles()
         if not targets:
             targets = self.profiles
@@ -1804,8 +2030,9 @@ class ManagerApp(tk.Tk):
             return
         first = targets[0]
         fp = first.fingerprint
+        title = f"Персональный Fingerprint: {first.name}" if personal else f"Массовый Fingerprint: {len(targets)} проф."
         win, panel = self._modal("Fingerprint настройки", 820, 610)
-        tk.Label(panel, text=f"Fingerprint: {len(targets)} проф.", bg="#1f1f1f", fg="#ffffff", font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(0, 16))
+        tk.Label(panel, text=title, bg="#1f1f1f", fg="#ffffff", font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(0, 16))
         form = tk.Frame(panel, bg="#1f1f1f")
         form.pack(fill=tk.BOTH, expand=True)
         vars_: dict[str, tk.Variable] = {
@@ -1841,6 +2068,23 @@ class ManagerApp(tk.Tk):
         tk.Checkbutton(form, text="Canvas noise", variable=vars_["canvas_noise"], bg="#1f1f1f", fg="#ffffff", selectcolor="#242424", activebackground="#1f1f1f").grid(row=6, column=0, columnspan=2, sticky="w", pady=12)
         tk.Checkbutton(form, text="WebRTC protection", variable=vars_["webrtc_protection"], bg="#1f1f1f", fg="#ffffff", selectcolor="#242424", activebackground="#1f1f1f").grid(row=6, column=2, columnspan=2, sticky="w", pady=12)
 
+        def write_fp(fp_value: Fingerprint) -> None:
+            vars_["user_agent"].set(fp_value.user_agent)
+            vars_["platform"].set(fp_value.platform)
+            vars_["locale"].set(fp_value.locale)
+            vars_["timezone"].set(fp_value.timezone)
+            vars_["screen_width"].set(str(fp_value.screen_width))
+            vars_["screen_height"].set(str(fp_value.screen_height))
+            vars_["viewport_width"].set(str(fp_value.viewport_width))
+            vars_["viewport_height"].set(str(fp_value.viewport_height))
+            vars_["hardware_concurrency"].set(str(fp_value.hardware_concurrency))
+            vars_["device_memory"].set(str(fp_value.device_memory))
+            vars_["max_touch_points"].set(str(fp_value.max_touch_points))
+            vars_["webgl_vendor"].set(fp_value.webgl_vendor)
+            vars_["webgl_renderer"].set(fp_value.webgl_renderer)
+            vars_["canvas_noise"].set(fp_value.canvas_noise)
+            vars_["webrtc_protection"].set(fp_value.webrtc_protection)
+
         def read_fp() -> Fingerprint:
             return Fingerprint(
                 user_agent=vars_["user_agent"].get().strip() or DEFAULT_USER_AGENTS[0],
@@ -1867,22 +2111,31 @@ class ManagerApp(tk.Tk):
             self.store.save()
             self.refresh_profile_table()
             self.enqueue_log(f"[{now_label()}] Fingerprint применён: {len(target_list)} профилей")
-            win.destroy()
 
         def randomize(target_list: list[BrowserProfile]) -> None:
-            for profile in target_list:
-                profile.fingerprint = self.random_fingerprint()
+            if personal and target_list:
+                fp_value = self.random_fingerprint()
+                write_fp(fp_value)
+                target_list[0].fingerprint = Fingerprint(**asdict(fp_value))
+            else:
+                preview_fp = self.random_fingerprint()
+                write_fp(preview_fp)
+                for index, profile in enumerate(target_list):
+                    profile.fingerprint = Fingerprint(**asdict(preview_fp)) if index == 0 else self.random_fingerprint()
             self.store.save()
             self.refresh_profile_table()
             self.enqueue_log(f"[{now_label()}] Fingerprint рандомизирован: {len(target_list)} профилей")
-            win.destroy()
 
         footer = tk.Frame(panel, bg="#1f1f1f")
         footer.pack(fill=tk.X, pady=(12, 0))
-        self._bar_button(footer, "Сохранить выбранным", lambda: save_to(targets)).pack(side=tk.LEFT, padx=(0, 8))
-        self._bar_button(footer, "Сохранить всем", lambda: save_to(self.profiles)).pack(side=tk.LEFT, padx=8)
-        self._bar_button(footer, "Рандом выбранным", lambda: randomize(targets)).pack(side=tk.LEFT, padx=8)
-        self._bar_button(footer, "Рандом всем", lambda: randomize(self.profiles)).pack(side=tk.LEFT, padx=8)
+        if personal:
+            self._bar_button(footer, "Применить", lambda: save_to([first])).pack(side=tk.LEFT, padx=(0, 8))
+            self._bar_button(footer, "Рандомизировать", lambda: randomize([first])).pack(side=tk.LEFT, padx=8)
+        else:
+            self._bar_button(footer, "Применить выбранным", lambda: save_to(targets)).pack(side=tk.LEFT, padx=(0, 8))
+            self._bar_button(footer, "Применить всем", lambda: save_to(self.profiles)).pack(side=tk.LEFT, padx=8)
+            self._bar_button(footer, "Рандом выбранным", lambda: randomize(targets)).pack(side=tk.LEFT, padx=8)
+            self._bar_button(footer, "Рандом всем", lambda: randomize(self.profiles)).pack(side=tk.LEFT, padx=8)
         self._bar_button(footer, "Закрыть", win.destroy).pack(side=tk.RIGHT)
 
     def open_cookie_panel(self, profiles: list[BrowserProfile] | None = None) -> None:
@@ -1965,23 +2218,21 @@ class ManagerApp(tk.Tk):
     def _modal(self, title: str, width: int, height: int) -> tuple[tk.Toplevel, tk.Frame]:
         win = tk.Toplevel(self)
         win.title(title)
-        win.configure(bg="#0f0f0f")
+        win.configure(bg="#1f1f1f")
         win.transient(self)
         win.lift()
         self.update_idletasks()
         x = self.winfo_rootx() + max(24, (self.winfo_width() - width) // 2)
         y = self.winfo_rooty() + max(24, (self.winfo_height() - height) // 2)
         win.geometry(f"{width}x{height}+{x}+{y}")
-        shadow = tk.Frame(win, bg="#0b0b0b")
-        shadow.place(x=8, y=8, relwidth=1, relheight=1, width=-8, height=-8)
         panel = tk.Frame(win, bg="#1f1f1f", padx=24, pady=22, highlightbackground="#343434", highlightthickness=1)
-        panel.place(x=0, y=0, relwidth=1, relheight=1, width=-8, height=-8)
+        panel.pack(fill=tk.BOTH, expand=True)
         return win, panel
 
     def _field(self, parent: tk.Widget, label: str, variable: tk.Variable, row: int, column: int, width: int | None = None, colspan: int = 1, show: str | None = None) -> tk.Entry:
-        tk.Label(parent, text=label, bg="#1f1f1f", fg="#9d9d9d").grid(row=row, column=column, sticky="w", pady=6)
+        tk.Label(parent, text=label, bg="#1f1f1f", fg="#9d9d9d").grid(row=row, column=column, sticky="w", pady=6, padx=(0, 6))
         entry = tk.Entry(parent, textvariable=variable, width=width, show=show, relief=tk.FLAT, bg="#242424", fg="#ffffff", insertbackground="#ffffff")
-        entry.grid(row=row, column=column + 1, columnspan=colspan, sticky="ew", padx=(8, 12), pady=6, ipady=5)
+        entry.grid(row=row, column=column + 1, columnspan=colspan, sticky="ew", padx=(0, 12), pady=6, ipady=5)
         return entry
 
     def _browse_to_var(self, variable: tk.Variable, parent: tk.Widget) -> None:
